@@ -1,0 +1,18 @@
+[package]
+name = "tower-csrf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.66"
+
+[dependencies]
+futures-util = "0.3.31"
+http = "1.0"
+thiserror = "2.0"
+tower = { version = "0.5", features = ["util"] }
+url = "2.5"
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1.0", features = ["macros", "rt"] }
+tower-test = "0.4"
+tracing = "0.1"
