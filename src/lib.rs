@@ -90,8 +90,8 @@ pub struct CrossOriginProtectionMiddleware<S> {
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for CrossOriginProtectionMiddleware<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
-    S::Error: Into<BoxError> + Send + 'static,
-    S::Future: Future<Output = Result<Response<ResBody>, S::Error>> + Send + 'static,
+    S::Error: Into<BoxError> + Send,
+    S::Future: Future<Output = Result<Response<ResBody>, S::Error>> + Send,
     ReqBody: Send + 'static,
     ResBody: Send + 'static,
 {
