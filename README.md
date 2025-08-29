@@ -16,6 +16,8 @@ The following features from the Go stdlib [implementation](https://cs.opensource
 
 - Custom handlers for error responses: this is not idiomatic for tower
 
+See [tests/csrf.rs](tests/csrf.rs) for an example using Axum.
+
 ## Open issues
 
 - More test coverage and line-by-line comparison with the reference implementation
