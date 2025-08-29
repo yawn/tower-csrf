@@ -14,7 +14,6 @@ This boils down to (quoting from the blog):
 
 The following features from the Go stdlib [implementation](https://cs.opensource.google/go/go/+/refs/tags/go1.25.0:src/net/http/csrf.go) are not implemented:
 
-- Skipping the middleware: not sure if there is a idiomatic alternative in tower
 - Custom handlers for error responses: this is not idiomatic for tower
 
 ## Open issues

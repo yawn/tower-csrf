@@ -5,7 +5,7 @@ use std::result::Result;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use http::{Method, Request, Response};
+use http::{Method, Request, Response, Uri};
 use tower::{BoxError, Layer, Service};
 use url::Url;
 
@@ -33,6 +33,30 @@ pub enum ProtectionError {
     SecFetchSiteUnexpectedValue(String),
 }
 
+struct Bypass<T: Fn(&Method, &Uri) -> bool>(T);
+
+impl<T: Fn(&Method, &Uri) -> bool> std::fmt::Debug for Bypass<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("<fn>").finish()
+    }
+}
+
+trait Filter: std::fmt::Debug + Send + Sync {
+    fn is_bypassed(&self, method: &Method, uri: &Uri) -> bool;
+}
+
+impl<T: Fn(&Method, &Uri) -> bool> Filter for Option<Bypass<T>>
+where
+    T: Send + Sync,
+{
+    fn is_bypassed(&self, method: &Method, uri: &Uri) -> bool {
+        match self {
+            Some(ref p) => p.0(method, uri),
+            None => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Origins(Arc<HashSet<String>>);
 
@@ -46,9 +70,19 @@ impl Origins {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CrossOriginProtectionLayer {
+    insecure_bypass: Arc<dyn Filter>,
     trusted_origins: Origins,
+}
+
+impl Default for CrossOriginProtectionLayer {
+    fn default() -> Self {
+        CrossOriginProtectionLayer {
+            insecure_bypass: Arc::new(Option::<Bypass<fn(&Method, &Uri) -> bool>>::default()),
+            trusted_origins: Origins::default(),
+        }
+    }
 }
 
 impl CrossOriginProtectionLayer {
@@ -66,25 +100,45 @@ impl CrossOriginProtectionLayer {
 
         Ok(self)
     }
+
+    pub fn with_insecure_bypass<F>(self, predicate: F) -> CrossOriginProtectionLayer
+    where
+        F: Fn(&Method, &Uri) -> bool + Send + Sync + 'static,
+    {
+        CrossOriginProtectionLayer {
+            insecure_bypass: Arc::new(Some(Bypass(predicate))),
+            trusted_origins: self.trusted_origins,
+        }
+    }
 }
 
 impl<S> Layer<S> for CrossOriginProtectionLayer {
     type Service = CrossOriginProtectionMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        let trusted_origins = self.trusted_origins.clone();
-
         CrossOriginProtectionMiddleware {
             inner,
-            trusted_origins,
+            insecure_bypass: self.insecure_bypass.clone(),
+            trusted_origins: self.trusted_origins.clone(),
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CrossOriginProtectionMiddleware<S> {
     inner: S,
+    insecure_bypass: Arc<dyn Filter>,
     trusted_origins: Origins,
+}
+
+impl<S: Default> Default for CrossOriginProtectionMiddleware<S> {
+    fn default() -> Self {
+        Self {
+            inner: S::default(),
+            insecure_bypass: Arc::new(Option::<Bypass<fn(&Method, &Uri) -> bool>>::default()),
+            trusted_origins: Origins::default(),
+        }
+    }
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for CrossOriginProtectionMiddleware<S>
@@ -116,6 +170,10 @@ where
 
 impl<S> CrossOriginProtectionMiddleware<S> {
     fn verify<Body>(&self, req: &Request<Body>) -> Result<(), ProtectionError> {
+        if self.insecure_bypass.is_bypassed(req.method(), req.uri()) {
+            return Ok(());
+        }
+
         if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
             return Ok(());
         }
@@ -171,6 +229,27 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 mod tests {
     use super::*;
     use http::Request;
+
+    #[test]
+    fn test_middleware_debug_trait() {
+        let layer = CrossOriginProtectionLayer::default();
+        let middleware = layer
+            .clone()
+            .with_insecure_bypass(|method, uri| method == Method::POST && uri.path() == "/bypass")
+            .layer(());
+
+        assert_eq!(
+            format!("{:?}", middleware),
+            "CrossOriginProtectionMiddleware { inner: (), insecure_bypass: Some(<fn>), trusted_origins: Origins({}) }"
+        );
+
+        let middleware = layer.layer(());
+
+        assert_eq!(
+            format!("{:?}", middleware),
+            "CrossOriginProtectionMiddleware { inner: (), insecure_bypass: None, trusted_origins: Origins({}) }"
+        );
+    }
 
     #[test]
     fn test_add_trusted_origin() {
@@ -304,6 +383,24 @@ mod tests {
             .unwrap();
 
         assert!(middleware.verify(&request).is_err());
+    }
+
+    #[test]
+    fn test_origin_mismatch_host_bypassed() {
+        let layer = CrossOriginProtectionLayer::default();
+        let middleware = layer
+            .with_insecure_bypass(|method, uri| method == Method::POST && uri.path() == "/bypass")
+            .layer(());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/bypass")
+            .header("origin", "https://evil.com")
+            .header("host", "example.com")
+            .body(())
+            .unwrap();
+
+        assert!(middleware.verify(&request).is_ok());
     }
 
     #[test]
