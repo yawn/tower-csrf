@@ -1,3 +1,17 @@
+//! Modern protection against cross-site request forgery (CSRF) attacks,
+//!
+//! This is _experimental_ middleware for [Tower](https://crates.io/crates/tower). It provides modern CSRF protection as outlined in a [blogpost](https://words.filippo.io/csrf/) by Filippo Valsorda, discussing the research background for integrating CSRF protection in Go 1.25's `net/http`.
+//!
+//! This boils down to (quoting from the blog):
+//!
+//! 1. Allow all GET, HEAD, or OPTIONS requests
+//! 2. If the Origin header matches an allow-list of trusted origins, allow the request
+//! 3. If the Sec-Fetch-Site header is present and the value is `same-origin` or `none`, allow the request, otherwise reject
+//! 4. If neither the Sec-Fetch-Site nor the Origin headers are present, allow the request
+//! 5. If the Origin header’s host (including the port) matches the Host header, allow the request, otherwise reject it
+//!
+//! The crate uses [tracing](https://docs.rs/tracing/latest/tracing/) to log passed requests and configuration changes. Errors are not logged, just pass through the
+//! chain.
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,28 +21,40 @@ use std::task::{Context, Poll};
 
 use http::{Method, Request, Response, Uri};
 use tower::{BoxError, Layer, Service};
+use tracing::{debug, instrument, trace};
 use url::Url;
 
+/// Errors that can occur during configuration of the layer.
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
+    /// An invalid origin url was added as a trusted origin.
     #[error(transparent)]
     InvalidOriginUrl(#[from] url::ParseError),
 
+    /// A origin url containing a path, query or fragment was added as a trusted origin.
     #[error("invalid origin {origin:?}: path, query, and fragment are not allowed")]
     InvalidOriginUrlComponents { origin: String },
 }
 
-#[derive(thiserror::Error, Debug)]
+/// Errors that can occur during request processing of the middleware.
+///
+/// These errors must be handled when using the middleware in web frameworks (such as axum) to e.g. log errors or
+/// render appropriate responses.
+#[derive(thiserror::Error, Debug, PartialEq)]
 pub enum ProtectionError {
+    /// A cross-origin request was detected.
     #[error("Cross-Origin request detected")]
     CrossOriginRequest,
 
+    /// The host request header cannot be parsed.
     #[error("Host header cannot be parsed")]
     MalformedHost(#[source] url::ParseError),
 
+    /// The origin request header cannot be parsed.
     #[error("Origin header cannot be parsed")]
     MalformedOrigin(#[source] url::ParseError),
 
+    /// The sec-fetch-site request header contains an unexpected value.
     #[error("Sec-Fetch-Site header is present with an unexpected value")]
     SecFetchSiteUnexpectedValue(String),
 }
@@ -70,6 +96,7 @@ impl Origins {
     }
 }
 
+/// Decorates a HTTP service with CSRF protection.
 #[derive(Clone, Debug)]
 pub struct CrossOriginProtectionLayer {
     insecure_bypass: Arc<dyn Filter>,
@@ -86,25 +113,36 @@ impl Default for CrossOriginProtectionLayer {
 }
 
 impl CrossOriginProtectionLayer {
+    /// Adds a trusted origin which allows all requests with an `Origin` header which exactly matches
+    /// the given value.
+    ///
+    /// Origin header values are of the form `scheme://host[:port]`.
     pub fn add_trusted_origin<S: Into<String>>(mut self, origin: S) -> Result<Self, ConfigError> {
         let origin = origin.into();
 
         // using url crate here for fragment support (see https://github.com/hyperium/http/issues/127)
         let url = Url::parse(&origin)?;
 
+        // note that the url crate will always normalize an empty path to "/"
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(ConfigError::InvalidOriginUrlComponents { origin });
         }
+
+        debug!(origin = %origin, "added trusted origin");
 
         self.trusted_origins.insert(origin);
 
         Ok(self)
     }
 
+    /// Adds a bypass function that returns `true` if the given request should bypass CSRF protection. Notes that this
+    /// might be insecure.
     pub fn with_insecure_bypass<F>(self, predicate: F) -> CrossOriginProtectionLayer
     where
         F: Fn(&Method, &Uri) -> bool + Send + Sync + 'static,
     {
+        debug!("added insecure bypass");
+
         CrossOriginProtectionLayer {
             insecure_bypass: Arc::new(Some(Bypass(predicate))),
             trusted_origins: self.trusted_origins,
@@ -124,6 +162,7 @@ impl<S> Layer<S> for CrossOriginProtectionLayer {
     }
 }
 
+/// CSRF protection middleware for HTTP requests.
 #[derive(Clone, Debug)]
 pub struct CrossOriginProtectionMiddleware<S> {
     inner: S,
@@ -169,12 +208,15 @@ where
 }
 
 impl<S> CrossOriginProtectionMiddleware<S> {
+    #[instrument(skip(self, req), fields(uri = %req.uri()))]
     fn verify<Body>(&self, req: &Request<Body>) -> Result<(), ProtectionError> {
         if self.insecure_bypass.is_bypassed(req.method(), req.uri()) {
+            trace!("request passed: bypassed");
             return Ok(());
         }
 
         if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+            trace!("request passed: safe method");
             return Ok(());
         }
 
@@ -183,6 +225,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
         if let Some(origin) = origin.and_then(|h| h.to_str().ok()) {
             if self.trusted_origins.contains(origin) {
+                trace!("request passed: trusted origin");
                 return Ok(());
             }
 
@@ -196,6 +239,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
         if let Some(sec_fetch_site) = sec_fetch_site.and_then(|h| h.to_str().ok()) {
             if matches!(sec_fetch_site, "same-origin" | "none") {
+                trace!("request passed: sec-fetch-site is same-origin or none");
                 return Ok(());
             } else {
                 return Err(ProtectionError::SecFetchSiteUnexpectedValue(
@@ -205,6 +249,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         }
 
         if origin.is_none() && sec_fetch_site.is_none() {
+            trace!("request passed: neither origin nor sec-fetch-site");
             return Ok(());
         }
 
@@ -216,6 +261,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
                 let host_url = Url::parse(&host_url).map_err(ProtectionError::MalformedHost)?;
 
                 if host_url == origin_url {
+                    trace!("request passed: host identical to origin");
                     return Ok(());
                 }
             }
@@ -227,32 +273,33 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
 #[cfg(test)]
 mod tests {
+    use tracing::Level;
+
     use super::*;
-    use http::Request;
+    use std::sync::Once;
 
-    #[test]
-    fn test_middleware_debug_trait() {
-        let layer = CrossOriginProtectionLayer::default();
-        let middleware = layer
-            .clone()
-            .with_insecure_bypass(|method, uri| method == Method::POST && uri.path() == "/bypass")
-            .layer(());
+    static INIT: Once = Once::new();
 
-        assert_eq!(
-            format!("{:?}", middleware),
-            "CrossOriginProtectionMiddleware { inner: (), insecure_bypass: Some(<fn>), trusted_origins: Origins({}) }"
-        );
-
-        let middleware = layer.layer(());
-
-        assert_eq!(
-            format!("{:?}", middleware),
-            "CrossOriginProtectionMiddleware { inner: (), insecure_bypass: None, trusted_origins: Origins({}) }"
-        );
+    fn init() {
+        INIT.call_once(|| {
+            tracing_subscriber::fmt()
+                .with_max_level(Level::TRACE)
+                .init();
+        });
     }
 
     #[test]
-    fn test_add_trusted_origin() {
+    fn test_url_path_normalization() {
+        for url in ["https://example.com/", "https://example.com"] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(url.path(), "/");
+        }
+    }
+
+    #[test]
+    fn test_layer_add_trusted_origin() {
+        init();
+
         assert!(matches!(
             CrossOriginProtectionLayer::default().add_trusted_origin("https://example.com"),
             Ok(_)
@@ -278,184 +325,279 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_methods_are_allowed() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
+    fn test_middleware_debug_trait() {
+        init();
 
-        let ok = ["GET", "HEAD", "OPTIONS"];
-
-        for method in ok {
-            let req = Request::builder()
-                .method(method)
-                .header("origin", "https://example.com")
-                .body(())
-                .unwrap();
-            assert!(middleware.verify(&req).is_ok());
-        }
-
-        let err = ["POST", "PUT", "DELETE", "PATCH"];
-
-        for method in err {
-            let req = Request::builder()
-                .method(method)
-                .header("origin", "https://example.com")
-                .body(())
-                .unwrap();
-            assert!(middleware.verify(&req).is_err());
-        }
-    }
-
-    #[test]
-    fn test_sec_fetch_site_same_origin_allowed() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-
-        let request = Request::builder()
-            .method("POST")
-            .header("sec-fetch-site", "same-origin")
-            .body(())
-            .unwrap();
-
-        assert!(middleware.verify(&request).is_ok());
-    }
-
-    #[test]
-    fn test_sec_fetch_site_none_allowed() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-
-        let request = Request::builder()
-            .method("POST")
-            .header("sec-fetch-site", "none")
-            .body(())
-            .unwrap();
-
-        assert!(middleware.verify(&request).is_ok());
-    }
-
-    #[test]
-    fn test_sec_fetch_site_cross_site_rejected() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-
-        let request = Request::builder()
-            .method("POST")
-            .header("sec-fetch-site", "cross-site")
-            .body(())
-            .unwrap();
-
-        assert!(middleware.verify(&request).is_err());
-    }
-
-    #[test]
-    fn test_origin_matches_host_allowed() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-
-        let request = Request::builder()
-            .method("POST")
-            .header("origin", "https://example.com")
-            .header("host", "example.com")
-            .body(())
-            .unwrap();
-
-        assert!(middleware.verify(&request).is_ok());
-    }
-
-    #[test]
-    fn test_origin_matches_host_with_port_allowed() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-
-        let request = Request::builder()
-            .method("POST")
-            .header("origin", "https://example.com:8080")
-            .header("host", "example.com:8080")
-            .body(())
-            .unwrap();
-
-        assert!(middleware.verify(&request).is_ok());
-    }
-
-    #[test]
-    fn test_origin_mismatch_host_rejected() {
-        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-
-        let request = Request::builder()
-            .method("POST")
-            .header("origin", "https://evil.com")
-            .header("host", "example.com")
-            .body(())
-            .unwrap();
-
-        assert!(middleware.verify(&request).is_err());
-    }
-
-    #[test]
-    fn test_origin_mismatch_host_bypassed() {
         let layer = CrossOriginProtectionLayer::default();
+
         let middleware = layer
+            .clone()
             .with_insecure_bypass(|method, uri| method == Method::POST && uri.path() == "/bypass")
             .layer(());
 
-        let request = Request::builder()
-            .method("POST")
-            .uri("/bypass")
-            .header("origin", "https://evil.com")
-            .header("host", "example.com")
-            .body(())
-            .unwrap();
+        assert_eq!(
+            format!("{:?}", middleware),
+            "CrossOriginProtectionMiddleware { inner: (), insecure_bypass: Some(<fn>), trusted_origins: Origins({}) }"
+        );
 
-        assert!(middleware.verify(&request).is_ok());
+        let middleware = layer.layer(());
+
+        assert_eq!(
+            format!("{:?}", middleware),
+            "CrossOriginProtectionMiddleware { inner: (), insecure_bypass: None, trusted_origins: Origins({}) }"
+        );
     }
 
     #[test]
-    fn test_no_origin_no_sec_fetch_site_allowed() {
+    fn test_middleware_sec_fetch_site() {
+        init();
+
         let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
 
-        let request = Request::builder().method("POST").body(()).unwrap();
+        struct Test {
+            name: &'static str,
+            method: http::Method,
+            sec_fetch_site: Option<&'static str>,
+            origin: Option<&'static str>,
+            result: Result<(), ProtectionError>,
+        }
 
-        assert!(middleware.verify(&request).is_ok());
+        let tests = [
+            Test {
+                name: "same-origin allowed",
+                method: Method::GET,
+                sec_fetch_site: Some("same-origin"),
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "none allowed",
+                method: Method::POST,
+                sec_fetch_site: Some("none"),
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "cross-site blocked",
+                method: Method::POST,
+                sec_fetch_site: Some("cross-site"),
+                origin: None,
+                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
+                    "cross-site".into(),
+                )),
+            },
+            Test {
+                name: "same-site blocked",
+                method: Method::POST,
+                sec_fetch_site: Some("same-site"),
+                origin: None,
+                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
+                    "same-site".into(),
+                )),
+            },
+            Test {
+                name: "no header with no origin",
+                method: Method::POST,
+                sec_fetch_site: None,
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "no header with matching origin",
+                method: Method::POST,
+                sec_fetch_site: None,
+                origin: Some("https://example.com"),
+                result: Ok(()),
+            },
+            Test {
+                name: "no header with mismatched origin",
+                method: Method::POST,
+                sec_fetch_site: None,
+                origin: Some("https://attacker.example"),
+                result: Err(ProtectionError::CrossOriginRequest),
+            },
+            Test {
+                name: "no header with null origin",
+                method: Method::POST,
+                sec_fetch_site: None,
+                origin: Some("null"),
+                result: Err(ProtectionError::CrossOriginRequest),
+            },
+            Test {
+                name: "GET allowed",
+                method: Method::GET,
+                sec_fetch_site: Some("cross-site"),
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "HEAD allowed",
+                method: Method::HEAD,
+                sec_fetch_site: Some("cross-site"),
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "OPTIONS allowed",
+                method: Method::OPTIONS,
+                sec_fetch_site: Some("cross-site"),
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "PUT allowed",
+                method: Method::PUT,
+                sec_fetch_site: Some("cross-site"),
+                origin: None,
+                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
+                    "cross-site".into(),
+                )),
+            },
+        ];
+
+        for test in tests {
+            let mut req = Request::builder()
+                .method(test.method)
+                .header("host", "example.com");
+
+            if let Some(sec_fetch_site) = test.sec_fetch_site {
+                req = req.header("sec-fetch-site", sec_fetch_site);
+            }
+
+            if let Some(origin) = test.origin {
+                req = req.header("origin", origin);
+            }
+
+            let req = req.body(()).unwrap();
+
+            assert_eq!(middleware.verify(&req), test.result, "{}", test.name);
+        }
     }
 
     #[test]
-    fn test_trusted_origin_with_sec_fetch_site_cross_site_allowed() {
-        let mut middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-        middleware.trusted_origins.insert("https://trusted.com");
+    fn test_middleware_trusted_origin_bypass() {
+        init();
 
-        let request = Request::builder()
-            .method("POST")
-            .header("sec-fetch-site", "cross-site")
-            .header("origin", "https://trusted.com")
-            .body(())
+        let layer = CrossOriginProtectionLayer::default()
+            .add_trusted_origin("https://trusted.example")
             .unwrap();
 
-        assert!(middleware.verify(&request).is_ok());
+        let middleware = layer.layer(());
+
+        struct Test {
+            name: &'static str,
+            sec_fetch_site: Option<&'static str>,
+            origin: Option<&'static str>,
+            result: Result<(), ProtectionError>,
+        }
+
+        let tests = [
+            Test {
+                name: "trusted origin without sec-fetch-site",
+                origin: Some("https://trusted.example"),
+                sec_fetch_site: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "trusted origin with cross-site",
+                origin: Some("https://trusted.example"),
+                sec_fetch_site: Some("cross-site"),
+                result: Ok(()),
+            },
+            Test {
+                name: "untrusted origin without sec-fetch-site",
+                origin: Some("https://attacker.example"),
+                sec_fetch_site: None,
+                result: Err(ProtectionError::CrossOriginRequest),
+            },
+            Test {
+                name: "untrusted origin with cross-site",
+                origin: Some("https://attacker.example"),
+                sec_fetch_site: Some("cross-site"),
+                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
+                    "cross-site".into(),
+                )),
+            },
+        ];
+
+        for test in tests {
+            let mut req = Request::builder()
+                .method("POST")
+                .header("host", "example.com");
+
+            if let Some(sec_fetch_site) = test.sec_fetch_site {
+                req = req.header("sec-fetch-site", sec_fetch_site);
+            }
+
+            if let Some(origin) = test.origin {
+                req = req.header("origin", origin);
+            }
+
+            let req = req.body(()).unwrap();
+
+            assert_eq!(middleware.verify(&req), test.result, "{}", test.name);
+        }
     }
 
     #[test]
-    fn test_trusted_origin_with_port_allowed() {
-        let mut middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-        middleware
-            .trusted_origins
-            .insert("https://trusted.com:8080");
+    fn test_middleware_bypass() {
+        init();
 
-        let request = Request::builder()
-            .method("POST")
-            .header("sec-fetch-site", "cross-site")
-            .header("origin", "https://trusted.com:8080")
-            .body(())
-            .unwrap();
+        let layer = CrossOriginProtectionLayer::default()
+            .with_insecure_bypass(|_method, uri| -> bool { uri.path() == "/bypass" });
 
-        assert!(middleware.verify(&request).is_ok());
-    }
+        let middleware = layer.layer(());
 
-    #[test]
-    fn test_trusted_origin_fallback_allowed() {
-        let mut middleware: CrossOriginProtectionMiddleware<()> = Default::default();
-        middleware.trusted_origins.insert("https://trusted.com");
+        struct Test {
+            name: &'static str,
+            path: &'static str,
+            sec_fetch_site: Option<&'static str>,
+            result: Result<(), ProtectionError>,
+        }
 
-        let request = Request::builder()
-            .method("POST")
-            .header("origin", "https://trusted.com")
-            .header("host", "different-host.com")
-            .body(())
-            .unwrap();
+        let tests = [
+            Test {
+                name: "bypass path without sec-fetch-site",
+                path: "/bypass",
+                sec_fetch_site: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "bypass path with cross-site",
+                path: "/bypass",
+                sec_fetch_site: Some("cross-site"),
+                result: Ok(()),
+            },
+            Test {
+                name: "non-bypass path without sec-fetch-site",
+                path: "/api",
+                sec_fetch_site: None,
+                result: Err(ProtectionError::CrossOriginRequest),
+            },
+            Test {
+                name: "non-bypass path with cross-site",
+                path: "/api",
+                sec_fetch_site: Some("cross-site"),
+                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
+                    "cross-site".into(),
+                )),
+            },
+        ];
 
-        assert!(middleware.verify(&request).is_ok());
+        for test in tests {
+            let mut req = Request::builder()
+                .method("POST")
+                .header("host", "example.com")
+                .header("origin", "https://attacker.example")
+                .uri(format!("https://example.com{}", test.path));
+
+            if let Some(sec_fetch_site) = test.sec_fetch_site {
+                req = req.header("sec-fetch-site", sec_fetch_site);
+            }
+
+            let req = req.body(()).unwrap();
+
+            assert_eq!(middleware.verify(&req), test.result, "{}", test.name);
+        }
     }
 }
