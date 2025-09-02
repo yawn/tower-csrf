@@ -1,8 +1,11 @@
 [package]
-name = "tower-csrf"
-version = "0.1.0"
+description = "Go 1.25+ CSRF middleware port for Rust Tower"
 edition = "2021"
+license-file = "LICENSE"
+name = "tower-csrf"
+repository = "https://github.com/yawn/tower-csrf"
 rust-version = "1.66"
+version = "0.1.0"
 
 [dependencies]
 http = "1.0"
