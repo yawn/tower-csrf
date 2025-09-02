@@ -46,6 +46,10 @@ pub enum ProtectionError {
     #[error("Cross-Origin request detected")]
     CrossOriginRequest,
 
+    /// A cross-origin request was detected.
+    #[error("Cross-Origin request from old browser detected")]
+    CrossOriginRequestFromOldBrowser,
+
     /// The host request header cannot be parsed.
     #[error("Host header cannot be parsed")]
     MalformedHost(#[source] url::ParseError),
@@ -53,10 +57,6 @@ pub enum ProtectionError {
     /// The origin request header cannot be parsed.
     #[error("Origin header cannot be parsed")]
     MalformedOrigin(#[source] url::ParseError),
-
-    /// The sec-fetch-site request header contains an unexpected value.
-    #[error("Sec-Fetch-Site header is present with an unexpected value")]
-    SecFetchSiteUnexpectedValue(String),
 }
 
 struct Bypass<T: Fn(&Method, &Uri) -> bool>(T);
@@ -209,65 +209,81 @@ where
 
 impl<S> CrossOriginProtectionMiddleware<S> {
     #[instrument(skip(self, req), fields(uri = %req.uri()))]
-    fn verify<Body>(&self, req: &Request<Body>) -> Result<(), ProtectionError> {
+    fn is_exempt<Body>(&self, req: &Request<Body>) -> bool {
         if self.insecure_bypass.is_bypassed(req.method(), req.uri()) {
             trace!("request passed: bypassed");
-            return Ok(());
+            return true;
         }
 
+        if let Some(origin) = req.headers().get("origin") {
+            if self
+                .trusted_origins
+                .contains(origin.to_str().unwrap_or_default())
+            {
+                trace!("request passed: trusted origin");
+                return true;
+            }
+        }
+
+        false
+    }
+
+    #[instrument(skip(self, req), fields(uri = %req.uri()))]
+    fn verify<Body>(&self, req: &Request<Body>) -> Result<(), ProtectionError> {
         if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
             trace!("request passed: safe method");
             return Ok(());
         }
 
-        let origin = req.headers().get("origin");
-        let mut origin_url = None;
-
-        if let Some(origin) = origin.and_then(|h| h.to_str().ok()) {
-            if self.trusted_origins.contains(origin) {
-                trace!("request passed: trusted origin");
-                return Ok(());
-            }
-
-            if origin != "null" {
-                let origin = Url::parse(origin).map_err(ProtectionError::MalformedOrigin)?;
-                origin_url = Some(origin);
-            }
-        }
-
-        let sec_fetch_site = req.headers().get("sec-fetch-site");
-
-        if let Some(sec_fetch_site) = sec_fetch_site.and_then(|h| h.to_str().ok()) {
+        if let Some(sec_fetch_site) = req
+            .headers()
+            .get("sec-fetch-site")
+            .and_then(|h| h.to_str().ok())
+        {
             if matches!(sec_fetch_site, "same-origin" | "none") {
                 trace!("request passed: sec-fetch-site is same-origin or none");
                 return Ok(());
+            } else if self.is_exempt(req) {
+                return Ok(());
             } else {
-                return Err(ProtectionError::SecFetchSiteUnexpectedValue(
-                    sec_fetch_site.into(),
-                ));
+                return Err(ProtectionError::CrossOriginRequest);
             }
         }
 
-        if origin.is_none() && sec_fetch_site.is_none() {
-            trace!("request passed: neither origin nor sec-fetch-site");
+        match req.headers().get("origin").and_then(|h| h.to_str().ok()) {
+            Some("null") => {}
+            Some(origin) => {
+                let origin = Url::parse(origin).map_err(ProtectionError::MalformedOrigin)?;
+
+                let origin_host = origin.host_str();
+                let host = req.headers().get("host").and_then(|h| h.to_str().ok());
+
+                // the origin header matches the host header. note that the host header
+                // doesn't include the scheme, so we don't know if this might be an
+                // http→https cross-origin request. we fail open, since all modern
+                // browsers support sec-fetch-site since 2023, and running an older
+                // browser makes a clear security trade-off already. sites can mitigate
+                // this with http strict transport security (hsts).
+
+                match (origin_host, host) {
+                    (Some(origin_host), Some(host)) if origin_host == host => {
+                        trace!("request passed: origin is same as host - ");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+            None => {
+                trace!("request passed: neither sec-fetch-site nor origin header (same-origin or not a browser request)");
+                return Ok(());
+            }
+        }
+
+        if self.is_exempt(req) {
             return Ok(());
         }
 
-        let host = req.headers().get("host");
-
-        if let Some(host) = host.and_then(|h| h.to_str().ok()) {
-            if let Some(origin_url) = origin_url {
-                let host_url = format!("{}://{}", origin_url.scheme(), host);
-                let host_url = Url::parse(&host_url).map_err(ProtectionError::MalformedHost)?;
-
-                if host_url == origin_url {
-                    trace!("request passed: host identical to origin");
-                    return Ok(());
-                }
-            }
-        }
-
-        Err(ProtectionError::CrossOriginRequest)
+        Err(ProtectionError::CrossOriginRequestFromOldBrowser)
     }
 }
 
@@ -382,18 +398,14 @@ mod tests {
                 method: Method::POST,
                 sec_fetch_site: Some("cross-site"),
                 origin: None,
-                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
-                    "cross-site".into(),
-                )),
+                result: Err(ProtectionError::CrossOriginRequest),
             },
             Test {
                 name: "same-site blocked",
                 method: Method::POST,
                 sec_fetch_site: Some("same-site"),
                 origin: None,
-                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
-                    "same-site".into(),
-                )),
+                result: Err(ProtectionError::CrossOriginRequest),
             },
             Test {
                 name: "no header with no origin",
@@ -414,14 +426,14 @@ mod tests {
                 method: Method::POST,
                 sec_fetch_site: None,
                 origin: Some("https://attacker.example"),
-                result: Err(ProtectionError::CrossOriginRequest),
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "no header with null origin",
                 method: Method::POST,
                 sec_fetch_site: None,
                 origin: Some("null"),
-                result: Err(ProtectionError::CrossOriginRequest),
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "GET allowed",
@@ -449,9 +461,7 @@ mod tests {
                 method: Method::PUT,
                 sec_fetch_site: Some("cross-site"),
                 origin: None,
-                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
-                    "cross-site".into(),
-                )),
+                result: Err(ProtectionError::CrossOriginRequest),
             },
         ];
 
@@ -508,15 +518,13 @@ mod tests {
                 name: "untrusted origin without sec-fetch-site",
                 origin: Some("https://attacker.example"),
                 sec_fetch_site: None,
-                result: Err(ProtectionError::CrossOriginRequest),
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "untrusted origin with cross-site",
                 origin: Some("https://attacker.example"),
                 sec_fetch_site: Some("cross-site"),
-                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
-                    "cross-site".into(),
-                )),
+                result: Err(ProtectionError::CrossOriginRequest),
             },
         ];
 
@@ -572,15 +580,13 @@ mod tests {
                 name: "non-bypass path without sec-fetch-site",
                 path: "/api",
                 sec_fetch_site: None,
-                result: Err(ProtectionError::CrossOriginRequest),
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "non-bypass path with cross-site",
                 path: "/api",
                 sec_fetch_site: Some("cross-site"),
-                result: Err(ProtectionError::SecFetchSiteUnexpectedValue(
-                    "cross-site".into(),
-                )),
+                result: Err(ProtectionError::CrossOriginRequest),
             },
         ];
 
