@@ -25,7 +25,7 @@ use tracing::{debug, instrument, trace};
 use url::Url;
 
 /// Errors that can occur during configuration of the layer.
-#[derive(thiserror::Error, Debug)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq)]
 pub enum ConfigError {
     /// An invalid origin url was added as a trusted origin.
     #[error(transparent)]
@@ -40,7 +40,7 @@ pub enum ConfigError {
 ///
 /// These errors must be handled when using the middleware in web frameworks (such as axum) to e.g. log errors or
 /// render appropriate responses.
-#[derive(thiserror::Error, Debug, PartialEq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq)]
 pub enum ProtectionError {
     /// A cross-origin request was detected.
     #[error("Cross-Origin request detected")]
