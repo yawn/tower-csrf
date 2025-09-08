@@ -16,4 +16,4 @@ This boils down to (quoting from the blog):
 4. If neither the Sec-Fetch-Site nor the Origin headers are present, allow the request
 5. If the Origin header’s host (including the port) matches the Host header, allow the request, otherwise reject it
 
-See [tests/csrf.rs](tests/csrf.rs) for an example using Axum.
+See [tests/csrf.rs](tests/axum.rs) for an example using Axum.
