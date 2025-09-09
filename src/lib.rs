@@ -193,6 +193,7 @@ where
     type Response = Response<ResBody>;
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        // see https://docs.rs/tower/latest/tower/trait.Service.html#be-careful-when-cloning-inner-services
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
