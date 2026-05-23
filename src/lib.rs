@@ -236,47 +236,46 @@ impl<S> CrossOriginProtectionMiddleware<S> {
             return Ok(());
         }
 
-        if let Some(sec_fetch_site) = req
-            .headers()
-            .get("sec-fetch-site")
-            .and_then(|h| h.to_str().ok())
-        {
-            if matches!(sec_fetch_site, "same-origin" | "none") {
+        // Raw bytes for Go parity: empty collapses to absent, non-decodable hits the default arm.
+        match req.headers().get("sec-fetch-site").map(|h| h.as_bytes()) {
+            Some(b"same-origin") | Some(b"none") => {
                 trace!("request passed: sec-fetch-site is same-origin or none");
                 return Ok(());
-            } else if self.is_exempt(req) {
-                return Ok(());
-            } else {
-                return Err(ProtectionError::CrossOriginRequest);
             }
+            None | Some(b"") => {} // fall through to Origin check
+            Some(_) if self.is_exempt(req) => return Ok(()),
+            Some(_) => return Err(ProtectionError::CrossOriginRequest),
         }
 
-        match req.headers().get("origin").and_then(|h| h.to_str().ok()) {
-            Some("null") => {}
-            Some(origin) => {
-                let origin = Url::parse(origin).map_err(ProtectionError::MalformedOrigin)?;
-
-                let origin_host = origin.host_str();
-                let host = req.headers().get("host").and_then(|h| h.to_str().ok());
-
-                // the origin header matches the host header. note that the host header
-                // doesn't include the scheme, so we don't know if this might be an
-                // http→https cross-origin request. we fail open, since all modern
-                // browsers support sec-fetch-site since 2023, and running an older
-                // browser makes a clear security trade-off already. sites can mitigate
-                // this with http strict transport security (hsts).
-
-                match (origin_host, host) {
-                    (Some(origin_host), Some(host)) if origin_host == host => {
-                        trace!("request passed: origin is same as host - ");
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-            None => {
+        // Same: empty is absent; any decode/parse failure falls through to is_exempt.
+        match req.headers().get("origin").map(|h| h.as_bytes()) {
+            None | Some(b"") => {
                 trace!("request passed: neither sec-fetch-site nor origin header (same-origin or not a browser request)");
                 return Ok(());
+            }
+            Some(bytes) => {
+                let parsed = std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| Url::parse(s).ok());
+
+                if let Some(origin_url) = parsed {
+                    let origin_host = origin_url.host_str();
+                    let host = req.headers().get("host").and_then(|h| h.to_str().ok());
+
+                    // the origin header matches the host header. note that the host header
+                    // doesn't include the scheme, so we don't know if this might be an
+                    // http→https cross-origin request. we fail open, since all modern
+                    // browsers support sec-fetch-site since 2023, and running an older
+                    // browser makes a clear security trade-off already. sites can mitigate
+                    // this with http strict transport security (hsts).
+
+                    if let (Some(origin_host), Some(host)) = (origin_host, host) {
+                        if origin_host == host {
+                            trace!("request passed: origin is same as host");
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
 
