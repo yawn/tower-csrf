@@ -290,10 +290,11 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Once;
+
     use tracing::Level;
 
     use super::*;
-    use std::sync::Once;
 
     static INIT: Once = Once::new();
 
@@ -371,11 +372,20 @@ mod tests {
 
         let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
 
+        const NON_DECODABLE: &[u8] = &[0xFF, 0xFE];
+        assert!(
+            http::HeaderValue::from_bytes(NON_DECODABLE)
+                .expect("NON_DECODABLE must be a valid HeaderValue")
+                .to_str()
+                .is_err(),
+            "NON_DECODABLE must fail HeaderValue::to_str()"
+        );
+
         struct Test {
             name: &'static str,
             method: http::Method,
-            sec_fetch_site: Option<&'static str>,
-            origin: Option<&'static str>,
+            sec_fetch_site: Option<&'static [u8]>,
+            origin: Option<&'static [u8]>,
             result: Result<(), ProtectionError>,
         }
 
@@ -383,28 +393,28 @@ mod tests {
             Test {
                 name: "same-origin allowed",
                 method: Method::GET,
-                sec_fetch_site: Some("same-origin"),
+                sec_fetch_site: Some(b"same-origin"),
                 origin: None,
                 result: Ok(()),
             },
             Test {
                 name: "none allowed",
                 method: Method::POST,
-                sec_fetch_site: Some("none"),
+                sec_fetch_site: Some(b"none"),
                 origin: None,
                 result: Ok(()),
             },
             Test {
                 name: "cross-site blocked",
                 method: Method::POST,
-                sec_fetch_site: Some("cross-site"),
+                sec_fetch_site: Some(b"cross-site"),
                 origin: None,
                 result: Err(ProtectionError::CrossOriginRequest),
             },
             Test {
                 name: "same-site blocked",
                 method: Method::POST,
-                sec_fetch_site: Some("same-site"),
+                sec_fetch_site: Some(b"same-site"),
                 origin: None,
                 result: Err(ProtectionError::CrossOriginRequest),
             },
@@ -419,50 +429,78 @@ mod tests {
                 name: "no header with matching origin",
                 method: Method::POST,
                 sec_fetch_site: None,
-                origin: Some("https://example.com"),
+                origin: Some(b"https://example.com"),
                 result: Ok(()),
             },
             Test {
                 name: "no header with mismatched origin",
                 method: Method::POST,
                 sec_fetch_site: None,
-                origin: Some("https://attacker.example"),
+                origin: Some(b"https://attacker.example"),
                 result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "no header with null origin",
                 method: Method::POST,
                 sec_fetch_site: None,
-                origin: Some("null"),
+                origin: Some(b"null"),
                 result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "GET allowed",
                 method: Method::GET,
-                sec_fetch_site: Some("cross-site"),
+                sec_fetch_site: Some(b"cross-site"),
                 origin: None,
                 result: Ok(()),
             },
             Test {
                 name: "HEAD allowed",
                 method: Method::HEAD,
-                sec_fetch_site: Some("cross-site"),
+                sec_fetch_site: Some(b"cross-site"),
                 origin: None,
                 result: Ok(()),
             },
             Test {
                 name: "OPTIONS allowed",
                 method: Method::OPTIONS,
-                sec_fetch_site: Some("cross-site"),
+                sec_fetch_site: Some(b"cross-site"),
                 origin: None,
                 result: Ok(()),
             },
             Test {
                 name: "PUT allowed",
                 method: Method::PUT,
-                sec_fetch_site: Some("cross-site"),
+                sec_fetch_site: Some(b"cross-site"),
                 origin: None,
                 result: Err(ProtectionError::CrossOriginRequest),
+            },
+            Test {
+                name: "non-decodable origin without sec-fetch-site rejected",
+                method: Method::POST,
+                sec_fetch_site: None,
+                origin: Some(NON_DECODABLE),
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+            Test {
+                name: "non-decodable sec-fetch-site without origin rejected",
+                method: Method::POST,
+                sec_fetch_site: Some(NON_DECODABLE),
+                origin: None,
+                result: Err(ProtectionError::CrossOriginRequest),
+            },
+            Test {
+                name: "empty sec-fetch-site without origin allowed",
+                method: Method::POST,
+                sec_fetch_site: Some(b""),
+                origin: None,
+                result: Ok(()),
+            },
+            Test {
+                name: "empty origin without sec-fetch-site allowed",
+                method: Method::POST,
+                sec_fetch_site: None,
+                origin: Some(b""),
+                result: Ok(()),
             },
         ];
 
