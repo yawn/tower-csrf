@@ -34,6 +34,11 @@ pub enum ConfigError {
     /// A origin url containing a path, query or fragment was added as a trusted origin.
     #[error("invalid origin {origin:?}: path, query, and fragment are not allowed")]
     InvalidOriginUrlComponents { origin: String },
+
+    /// An opaque-origin url (e.g. `file://`, `data:`) was added as a trusted origin.
+    /// Such origins serialize to `"null"` and can never match a request Origin.
+    #[error("invalid origin {origin:?}: opaque origins cannot serve as trusted origins")]
+    OpaqueOrigin { origin: String },
 }
 
 /// Errors that can occur during request processing of the middleware.
@@ -128,9 +133,18 @@ impl CrossOriginProtectionLayer {
             return Err(ConfigError::InvalidOriginUrlComponents { origin });
         }
 
-        debug!(origin = %origin, "added trusted origin");
+        if !url.origin().is_tuple() {
+            return Err(ConfigError::OpaqueOrigin { origin });
+        }
 
-        self.trusted_origins.insert(origin);
+        // Store the canonical ascii serialization (lowercased scheme/host,
+        // default ports stripped) so the lookup against parsed request
+        // origins matches regardless of how the developer typed the config.
+        let normalized = url.origin().ascii_serialization();
+
+        debug!(origin = %normalized, "added trusted origin");
+
+        self.trusted_origins.insert(normalized);
 
         Ok(self)
     }
@@ -216,14 +230,17 @@ impl<S> CrossOriginProtectionMiddleware<S> {
             return true;
         }
 
-        if let Some(origin) = req.headers().get("origin") {
-            if self
-                .trusted_origins
-                .contains(origin.to_str().unwrap_or_default())
-            {
-                trace!("request passed: trusted origin");
-                return true;
-            }
+        let trusted = req
+            .headers()
+            .get("origin")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| Url::parse(s).ok())
+            .map(|u| u.origin().ascii_serialization())
+            .is_some_and(|s| self.trusted_origins.contains(&s));
+
+        if trusted {
+            trace!("request passed: trusted origin");
+            return true;
         }
 
         false
@@ -338,6 +355,74 @@ mod tests {
                 CrossOriginProtectionLayer::default().add_trusted_origin(origin),
                 Err(ConfigError::InvalidOriginUrlComponents { origin }) if origin == origin
             ));
+        }
+
+        // Opaque-origin inputs serialize to "null" and can never match an
+        // incoming request Origin; reject them at config time rather than
+        // silently storing a dead entry.
+        assert!(matches!(
+            CrossOriginProtectionLayer::default().add_trusted_origin("file:///"),
+            Err(ConfigError::OpaqueOrigin { .. })
+        ));
+    }
+
+    #[test]
+    fn test_middleware_trusted_origin_normalization() {
+        init();
+
+        // Each row inserts a non-canonical form of the trusted origin and
+        // sends a request bearing the canonical browser-style Origin header.
+        // Pre-M2 these would all silently fail to match because the raw
+        // input string was stored byte-for-byte.
+        struct Test {
+            name: &'static str,
+            trusted: &'static str,
+            origin: &'static str,
+        }
+
+        let tests = [
+            Test {
+                name: "scheme and host case folded",
+                trusted: "HTTPS://Example.COM",
+                origin: "https://example.com",
+            },
+            Test {
+                name: "trailing slash stripped",
+                trusted: "https://example.com/",
+                origin: "https://example.com",
+            },
+            Test {
+                name: "default https port stripped",
+                trusted: "https://example.com:443",
+                origin: "https://example.com",
+            },
+            Test {
+                name: "default http port stripped",
+                trusted: "http://example.com:80",
+                origin: "http://example.com",
+            },
+            Test {
+                name: "non-default port preserved",
+                trusted: "https://example.com:8443",
+                origin: "https://example.com:8443",
+            },
+        ];
+
+        for test in tests {
+            let middleware = CrossOriginProtectionLayer::default()
+                .add_trusted_origin(test.trusted)
+                .unwrap_or_else(|e| panic!("{}: add_trusted_origin failed: {e}", test.name))
+                .layer(());
+
+            let req = Request::builder()
+                .method("POST")
+                .header("host", "other.example")
+                .header("origin", test.origin)
+                .header("sec-fetch-site", "cross-site")
+                .body(())
+                .unwrap();
+
+            assert_eq!(middleware.verify(&req), Ok(()), "{}", test.name);
         }
     }
 
