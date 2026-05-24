@@ -1,39 +1,22 @@
 use axum::{
     body::Body,
-    error_handling::HandleErrorLayer,
     extract::Request,
     http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{get, post},
-    BoxError, Router,
+    Router,
 };
-use tower::{ServiceBuilder, ServiceExt};
+use tower::ServiceExt;
 use tower_csrf::{CrossOriginProtectionLayer, ProtectionError};
-use tracing::error;
-
-async fn handle_error(error: BoxError) -> Response<Body> {
-    if let Some(csrf) = error.downcast_ref::<ProtectionError>() {
-        error!("csrf error occured: {}", csrf);
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    error!("error occured: {}", error);
-    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-}
 
 fn create_app() -> Router {
-    let layer = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(handle_error))
+    Router::new()
+        .route("/foo", get(|| async { "foo" }))
+        .route("/bar", post(|| async { "bar" }))
         .layer(
             CrossOriginProtectionLayer::default()
                 .add_trusted_origin("https://example.com")
                 .unwrap(),
-        );
-
-    Router::new()
-        .route("/foo", get(|| async { "foo" }))
-        .route("/bar", post(|| async { "bar" }))
-        .layer(layer)
+        )
 }
 
 #[tokio::test]
@@ -72,6 +55,10 @@ async fn test_bar_endpoint_returns_csrf_error() {
     let res = app.oneshot(req).await.unwrap();
 
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        res.extensions().get::<ProtectionError>(),
+        Some(&ProtectionError::CrossOriginRequestFromOldBrowser),
+    );
 }
 
 #[tokio::test]

@@ -13,14 +13,18 @@
 //! The crate uses [tracing](https://docs.rs/tracing/latest/tracing/) to log passed requests and configuration changes. Errors are not logged, just pass through the
 //! chain.
 use std::collections::HashSet;
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::result::Result;
+use std::str;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use http::{Method, Request, Response, Uri};
-use tower::{BoxError, Layer, Service};
+use http::{Method, Request, Response, StatusCode, Uri};
+use pin_project_lite::pin_project;
+use tower::{Layer, Service};
 use tracing::{debug, instrument, trace};
 
 mod url;
@@ -69,8 +73,8 @@ type BypassFn = dyn Fn(&Method, &Uri) -> bool + Send + Sync + 'static;
 
 struct DebugFn;
 
-impl std::fmt::Debug for DebugFn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for DebugFn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("<fn>")
     }
 }
@@ -95,8 +99,8 @@ pub struct CrossOriginProtectionLayer {
     trusted_origins: Origins,
 }
 
-impl std::fmt::Debug for CrossOriginProtectionLayer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for CrossOriginProtectionLayer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("CrossOriginProtectionLayer")
             .field(
                 "insecure_bypass",
@@ -165,8 +169,8 @@ impl<S: Default> Default for CrossOriginProtectionMiddleware<S> {
     }
 }
 
-impl<S: std::fmt::Debug> std::fmt::Debug for CrossOriginProtectionMiddleware<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Debug> Debug for CrossOriginProtectionMiddleware<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("CrossOriginProtectionMiddleware")
             .field("inner", &self.inner)
             .field(
@@ -180,29 +184,77 @@ impl<S: std::fmt::Debug> std::fmt::Debug for CrossOriginProtectionMiddleware<S> 
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for CrossOriginProtectionMiddleware<S>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
-    S::Error: Into<BoxError> + Send,
-    S::Future: Future<Output = Result<Response<ResBody>, S::Error>> + Send,
-    ReqBody: Send + 'static,
-    ResBody: Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
+    ResBody: Default,
 {
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Error = S::Error;
+    type Future = ResponseFuture<S::Future, ResBody>;
     type Response = Response<ResBody>;
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // see https://docs.rs/tower/latest/tower/trait.Service.html#be-careful-when-cloning-inner-services
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-
         match self.verify(&req) {
-            Ok(_) => Box::pin(async move { inner.call(req).await.map_err(Into::into) }),
-            Err(err) => Box::pin(async move { Err(err.into()) }),
+            Ok(_) => ResponseFuture::future(self.inner.call(req)),
+            Err(err) => ResponseFuture::rejected(err),
         }
     }
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
+        self.inner.poll_ready(cx)
+    }
+}
+
+pin_project! {
+    pub struct ResponseFuture<F, ResBody> {
+        #[pin]
+        kind: Kind<F, ResBody>,
+    }
+}
+
+pin_project! {
+    #[project = KindProj]
+    enum Kind<F, ResBody> {
+        Future { #[pin] future: F },
+        Rejected { error: Option<ProtectionError>, _body: PhantomData<ResBody> },
+    }
+}
+
+impl<F, ResBody> ResponseFuture<F, ResBody> {
+    fn future(future: F) -> Self {
+        Self {
+            kind: Kind::Future { future },
+        }
+    }
+
+    fn rejected(error: ProtectionError) -> Self {
+        Self {
+            kind: Kind::Rejected {
+                error: Some(error),
+                _body: PhantomData,
+            },
+        }
+    }
+}
+
+impl<F, E, ResBody> Future for ResponseFuture<F, ResBody>
+where
+    F: Future<Output = Result<Response<ResBody>, E>>,
+    ResBody: Default,
+{
+    type Output = Result<Response<ResBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project().kind.project() {
+            KindProj::Future { future } => future.poll(cx),
+            KindProj::Rejected { error, _body } => {
+                let error = error
+                    .take()
+                    .expect("ResponseFuture polled after completion");
+                let mut response = Response::new(ResBody::default());
+                *response.status_mut() = StatusCode::FORBIDDEN;
+                response.extensions_mut().insert(error);
+                Poll::Ready(Ok(response))
+            }
+        }
     }
 }
 
@@ -244,7 +296,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
         let origin_uri = origin
             .filter(|b| !b.is_empty())
-            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|b| str::from_utf8(b).ok())
             .and_then(|s| s.parse::<Uri>().ok());
 
         let sec_fetch_site = req.headers().get("sec-fetch-site").map(|h| h.as_bytes());
@@ -272,7 +324,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         if let Some(uri) = &origin_uri {
             // compare effective ports (scheme default when implicit). Host has no scheme, so http→https can't be detected here; fail open per HSTS.
             let authority = host
-                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|b| str::from_utf8(b).ok())
                 .and_then(|s| s.parse::<http::uri::Authority>().ok());
 
             // fall back to the request URI when the Host header is missing or unparseable
