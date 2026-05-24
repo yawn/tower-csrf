@@ -248,6 +248,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
         let sec_fetch_site = req.headers().get("sec-fetch-site").map(|h| h.as_bytes());
 
+        // Fetch spec mandates lowercase here; exact byte match is intentional.
         match sec_fetch_site {
             Some(b"same-origin") | Some(b"none") => {
                 trace!("request passed: sec-fetch-site is same-origin or none");
@@ -268,17 +269,22 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         let host = req.headers().get("host").map(|h| h.as_bytes());
 
         if let Some(uri) = &origin_uri {
-            // compare effective ports (scheme default when implicit). Host has no
-            // scheme, so http→https can't be detected here; fail open per HSTS.
+            // compare effective ports (scheme default when implicit). Host has no scheme, so http→https can't be detected here; fail open per HSTS.
             let authority = host
                 .and_then(|b| std::str::from_utf8(b).ok())
                 .and_then(|s| s.parse::<http::uri::Authority>().ok());
 
-            if let (Some(origin_host), Some(authority)) = (uri.host(), authority) {
-                let port_origin = uri.effective_port();
-                let port_host = authority.port_u16().or(port_origin);
+            // fall back to the request URI when the Host header is missing or unparseable
+            let (host_name, port_host) = match authority.as_ref() {
+                Some(a) => (Some(a.host()), a.port_u16()),
+                None => (req.uri().host(), req.uri().port_u16()),
+            };
 
-                if origin_host.eq_ignore_ascii_case(authority.host()) && port_origin == port_host {
+            if let (Some(origin_host), Some(host_name)) = (uri.host(), host_name) {
+                let port_origin = uri.effective_port();
+                let port_host = port_host.or(port_origin);
+
+                if origin_host.eq_ignore_ascii_case(host_name) && port_origin == port_host {
                     trace!("request passed: origin is same as host");
                     return Ok(());
                 }
@@ -395,7 +401,8 @@ mod tests {
 
         struct Test {
             name: &'static str,
-            host: &'static str,
+            uri: &'static str,
+            host: Option<&'static str>,
             origin: &'static str,
             result: Result<(), ProtectionError>,
         }
@@ -403,55 +410,84 @@ mod tests {
         let tests = [
             Test {
                 name: "default port both sides",
-                host: "example.com",
+                uri: "/",
+                host: Some("example.com"),
                 origin: "https://example.com",
                 result: Ok(()),
             },
             Test {
                 name: "same non-default port both sides",
-                host: "example.com:8443",
+                uri: "/",
+                host: Some("example.com:8443"),
                 origin: "https://example.com:8443",
                 result: Ok(()),
             },
             Test {
                 name: "explicit default port both sides",
-                host: "example.com:443",
+                uri: "/",
+                host: Some("example.com:443"),
                 origin: "https://example.com:443",
                 result: Ok(()),
             },
             Test {
                 name: "mismatched non-default ports",
-                host: "example.com:8443",
+                uri: "/",
+                host: Some("example.com:8443"),
                 origin: "https://example.com:8444",
                 result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
             Test {
                 name: "origin has explicit default, host implicit",
-                host: "example.com",
+                uri: "/",
+                host: Some("example.com"),
                 origin: "https://example.com:443",
                 result: Ok(()),
             },
             Test {
                 name: "host has explicit default, origin implicit",
-                host: "example.com:443",
+                uri: "/",
+                host: Some("example.com:443"),
                 origin: "https://example.com",
                 result: Ok(()),
             },
             Test {
-                name: "unparseable host",
-                host: "not a valid authority",
+                name: "unparseable host falls back to uri authority",
+                uri: "https://example.com/path",
+                host: Some("not a valid authority"),
+                origin: "https://example.com",
+                result: Ok(()),
+            },
+            Test {
+                name: "missing host, uri carries authority (match)",
+                uri: "https://example.com/path",
+                host: None,
+                origin: "https://example.com",
+                result: Ok(()),
+            },
+            Test {
+                name: "missing host, uri authority mismatch",
+                uri: "https://other.example/path",
+                host: None,
+                origin: "https://example.com",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+            Test {
+                name: "missing host and no uri authority",
+                uri: "/path",
+                host: None,
                 origin: "https://example.com",
                 result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
         ];
 
         for test in tests {
-            let req = Request::builder()
-                .method(Method::POST)
-                .header("host", test.host)
-                .header("origin", test.origin)
-                .body(())
-                .unwrap();
+            let mut req = Request::builder().method(Method::POST).uri(test.uri);
+
+            if let Some(host) = test.host {
+                req = req.header("host", host);
+            }
+
+            let req = req.header("origin", test.origin).body(()).unwrap();
 
             assert_eq!(middleware.verify(&req), test.result, "{}", test.name);
         }
