@@ -12,7 +12,6 @@ http = "1.0"
 thiserror = "2.0"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
-url = "2.5"
 
 [dev-dependencies]
 axum = "0.8"

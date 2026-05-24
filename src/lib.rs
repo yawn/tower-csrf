@@ -22,23 +22,32 @@ use std::task::{Context, Poll};
 use http::{Method, Request, Response, Uri};
 use tower::{BoxError, Layer, Service};
 use tracing::{debug, instrument, trace};
-use url::Url;
+
+mod url;
+use url::UriExt;
 
 /// Errors that can occur during configuration of the layer.
 #[derive(Clone, Debug, thiserror::Error, PartialEq)]
 pub enum ConfigError {
-    /// An invalid origin url was added as a trusted origin.
-    #[error(transparent)]
-    InvalidOriginUrl(#[from] url::ParseError),
+    /// The origin string could not be parsed as a URI.
+    #[error("invalid origin {origin:?}: {message}")]
+    InvalidOriginUrl { origin: String, message: String },
 
     /// A origin url containing a path, query or fragment was added as a trusted origin.
     #[error("invalid origin {origin:?}: path, query, and fragment are not allowed")]
     InvalidOriginUrlComponents { origin: String },
 
-    /// An opaque-origin url (e.g. `file://`, `data:`) was added as a trusted origin.
-    /// Such origins serialize to `"null"` and can never match a request Origin.
-    #[error("invalid origin {origin:?}: opaque origins cannot serve as trusted origins")]
+    /// An origin with a scheme other than `http` or `https` (e.g. `file://`,
+    /// `mailto:`, or a bare host with no scheme) was added as a trusted
+    /// origin. Such origins can never match a browser-supplied request Origin.
+    #[error("invalid origin {origin:?}: scheme must be http or https")]
     OpaqueOrigin { origin: String },
+
+    /// A trusted origin contained non-ASCII characters. Browsers send IDN
+    /// hostnames in punycode form, so the configured value must use the
+    /// punycode form (e.g. `xn--exmple-cua.com`) to ever match.
+    #[error("invalid origin {origin:?}: non-ASCII hostnames must be supplied in punycode (xn--…)")]
+    NonAsciiHostname { origin: String },
 }
 
 /// Errors that can occur during request processing of the middleware.
@@ -54,14 +63,6 @@ pub enum ProtectionError {
     /// A cross-origin request was detected.
     #[error("Cross-Origin request from old browser detected")]
     CrossOriginRequestFromOldBrowser,
-
-    /// The host request header cannot be parsed.
-    #[error("Host header cannot be parsed")]
-    MalformedHost(#[source] url::ParseError),
-
-    /// The origin request header cannot be parsed.
-    #[error("Origin header cannot be parsed")]
-    MalformedOrigin(#[source] url::ParseError),
 }
 
 struct Bypass<T: Fn(&Method, &Uri) -> bool>(T);
@@ -124,23 +125,9 @@ impl CrossOriginProtectionLayer {
     /// Origin header values are of the form `scheme://host[:port]`.
     pub fn add_trusted_origin<S: Into<String>>(mut self, origin: S) -> Result<Self, ConfigError> {
         let origin = origin.into();
-
-        // using url crate here for fragment support (see https://github.com/hyperium/http/issues/127)
-        let url = Url::parse(&origin)?;
-
-        // note that the url crate will always normalize an empty path to "/"
-        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-            return Err(ConfigError::InvalidOriginUrlComponents { origin });
-        }
-
-        if !url.origin().is_tuple() {
-            return Err(ConfigError::OpaqueOrigin { origin });
-        }
-
-        // Store the canonical ascii serialization (lowercased scheme/host,
-        // default ports stripped) so the lookup against parsed request
-        // origins matches regardless of how the developer typed the config.
-        let normalized = url.origin().ascii_serialization();
+        let normalized = Uri::parse_origin(&origin)?
+            .canonical()
+            .expect("parse_origin validates scheme and host");
 
         debug!(origin = %normalized, "added trusted origin");
 
@@ -223,19 +210,15 @@ where
 }
 
 impl<S> CrossOriginProtectionMiddleware<S> {
-    #[instrument(skip(self, req), fields(uri = %req.uri()))]
-    fn is_exempt<Body>(&self, req: &Request<Body>) -> bool {
-        if self.insecure_bypass.is_bypassed(req.method(), req.uri()) {
+    #[instrument(skip(self, origin), fields(uri = %uri))]
+    fn is_exempt(&self, method: &Method, uri: &Uri, origin: Option<&Uri>) -> bool {
+        if self.insecure_bypass.is_bypassed(method, uri) {
             trace!("request passed: bypassed");
             return true;
         }
 
-        let trusted = req
-            .headers()
-            .get("origin")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| Url::parse(s).ok())
-            .map(|u| u.origin().ascii_serialization())
+        let trusted = origin
+            .and_then(|u| u.canonical())
             .is_some_and(|s| self.trusted_origins.contains(&s));
 
         if trusted {
@@ -248,58 +231,61 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
     #[instrument(skip(self, req), fields(uri = %req.uri()))]
     fn verify<Body>(&self, req: &Request<Body>) -> Result<(), ProtectionError> {
-        if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        if matches!(
+            req.method(),
+            &Method::GET | &Method::HEAD | &Method::OPTIONS
+        ) {
             trace!("request passed: safe method");
             return Ok(());
         }
 
-        // Raw bytes for Go parity: empty collapses to absent, non-decodable hits the default arm.
-        match req.headers().get("sec-fetch-site").map(|h| h.as_bytes()) {
+        let origin = req.headers().get("origin").map(|h| h.as_bytes());
+
+        let origin_uri = origin
+            .filter(|b| !b.is_empty())
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<Uri>().ok());
+
+        let sec_fetch_site = req.headers().get("sec-fetch-site").map(|h| h.as_bytes());
+
+        match sec_fetch_site {
             Some(b"same-origin") | Some(b"none") => {
                 trace!("request passed: sec-fetch-site is same-origin or none");
                 return Ok(());
             }
             None | Some(b"") => {} // fall through to Origin check
-            Some(_) if self.is_exempt(req) => return Ok(()),
+            Some(_) if self.is_exempt(req.method(), req.uri(), origin_uri.as_ref()) => {
+                return Ok(())
+            }
             Some(_) => return Err(ProtectionError::CrossOriginRequest),
         }
 
-        // Same: empty is absent; any decode/parse failure falls through to is_exempt.
-        match req.headers().get("origin").map(|h| h.as_bytes()) {
-            None | Some(b"") => {
-                trace!("request passed: neither sec-fetch-site nor origin header (same-origin or not a browser request)");
-                return Ok(());
-            }
-            Some(bytes) => {
-                let parsed = std::str::from_utf8(bytes)
-                    .ok()
-                    .and_then(|s| Url::parse(s).ok());
+        if matches!(origin, None | Some(b"")) {
+            trace!("request passed: neither sec-fetch-site nor origin header (same-origin or not a browser request)");
+            return Ok(());
+        }
 
-                if let Some(origin_url) = parsed {
-                    // Compare effective ports (scheme default when implicit). Host has no
-                    // scheme, so http→https can't be detected here; fail open per HSTS.
-                    let authority = req
-                        .headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|h| h.parse::<http::uri::Authority>().ok());
+        let host = req.headers().get("host").map(|h| h.as_bytes());
 
-                    if let (Some(origin_host), Some(authority)) =
-                        (origin_url.host_str(), authority)
-                    {
-                        let origin_port = origin_url.port_or_known_default();
-                        let host_port = authority.port_u16().or(origin_port);
+        if let Some(uri) = &origin_uri {
+            // compare effective ports (scheme default when implicit). Host has no
+            // scheme, so http→https can't be detected here; fail open per HSTS.
+            let authority = host
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|s| s.parse::<http::uri::Authority>().ok());
 
-                        if origin_host == authority.host() && origin_port == host_port {
-                            trace!("request passed: origin is same as host");
-                            return Ok(());
-                        }
-                    }
+            if let (Some(origin_host), Some(authority)) = (uri.host(), authority) {
+                let port_origin = uri.effective_port();
+                let port_host = authority.port_u16().or(port_origin);
+
+                if origin_host.eq_ignore_ascii_case(authority.host()) && port_origin == port_host {
+                    trace!("request passed: origin is same as host");
+                    return Ok(());
                 }
             }
         }
 
-        if self.is_exempt(req) {
+        if self.is_exempt(req.method(), req.uri(), origin_uri.as_ref()) {
             return Ok(());
         }
 
@@ -326,46 +312,18 @@ mod tests {
     }
 
     #[test]
-    fn test_url_path_normalization() {
-        for url in ["https://example.com/", "https://example.com"] {
-            let url = Url::parse(url).unwrap();
-            assert_eq!(url.path(), "/");
-        }
-    }
-
-    #[test]
     fn test_layer_add_trusted_origin() {
         init();
 
+        // Smoke check that the layer threads parse_origin's Ok and Err
+        // through; the full validation matrix lives in url.rs.
         assert!(matches!(
             CrossOriginProtectionLayer::default().add_trusted_origin("https://example.com"),
             Ok(_)
         ));
-
-        for origin in ["not a valid url", "example.com", "https://"] {
-            assert!(matches!(
-                CrossOriginProtectionLayer::default().add_trusted_origin(origin),
-                Err(ConfigError::InvalidOriginUrl(_))
-            ));
-        }
-
-        for origin in [
-            "https://example.com/path",
-            "https://example.com/path?query=value",
-            "https://example.com/path#fragment",
-        ] {
-            assert!(matches!(
-                CrossOriginProtectionLayer::default().add_trusted_origin(origin),
-                Err(ConfigError::InvalidOriginUrlComponents { origin }) if origin == origin
-            ));
-        }
-
-        // Opaque-origin inputs serialize to "null" and can never match an
-        // incoming request Origin; reject them at config time rather than
-        // silently storing a dead entry.
         assert!(matches!(
-            CrossOriginProtectionLayer::default().add_trusted_origin("file:///"),
-            Err(ConfigError::OpaqueOrigin { .. })
+            CrossOriginProtectionLayer::default().add_trusted_origin("not a valid url"),
+            Err(ConfigError::InvalidOriginUrl { .. })
         ));
     }
 
