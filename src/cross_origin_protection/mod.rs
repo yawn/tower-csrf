@@ -14,43 +14,74 @@ pub use layer::CrossOriginProtectionLayer;
 pub use service::CrossOriginProtectionMiddleware;
 
 /// Errors that can occur during configuration of the layer.
-#[derive(Clone, Debug, thiserror::Error, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConfigError {
     /// The origin string could not be parsed as a URI.
-    #[error("invalid origin {origin:?}: {message}")]
     InvalidOriginUrl { origin: String, message: String },
 
     /// A origin url containing a path, query or fragment was added as a trusted origin.
-    #[error("invalid origin {origin:?}: path, query, and fragment are not allowed")]
     InvalidOriginUrlComponents { origin: String },
 
     /// An origin with a scheme other than `http` or `https` (e.g. `file://`,
     /// `mailto:`, or a bare host with no scheme) was added as a trusted
     /// origin. Such origins can never match a browser-supplied request Origin.
-    #[error("invalid origin {origin:?}: scheme must be http or https")]
     OpaqueOrigin { origin: String },
 
     /// A trusted origin contained non-ASCII characters. Browsers send IDN
     /// hostnames in punycode form, so the configured value must use the
     /// punycode form (e.g. `xn--exmple-cua.com`) to ever match.
-    #[error("invalid origin {origin:?}: non-ASCII hostnames must be supplied in punycode (xn--…)")]
     NonAsciiHostname { origin: String },
 }
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::InvalidOriginUrl { origin, message } => {
+                write!(f, "invalid origin {origin:?}: {message}")
+            }
+            ConfigError::InvalidOriginUrlComponents { origin } => write!(
+                f,
+                "invalid origin {origin:?}: path, query, and fragment are not allowed"
+            ),
+            ConfigError::OpaqueOrigin { origin } => write!(
+                f,
+                "invalid origin {origin:?}: scheme must be http or https"
+            ),
+            ConfigError::NonAsciiHostname { origin } => write!(
+                f,
+                "invalid origin {origin:?}: non-ASCII hostnames must be supplied in punycode (xn--…)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// Errors that can occur during request processing of the middleware.
 ///
 /// These errors must be handled when using the middleware in web frameworks (such as axum) to e.g. log errors or
 /// render appropriate responses.
-#[derive(Clone, Debug, thiserror::Error, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtectionError {
     /// A cross-origin request was detected.
-    #[error("Cross-Origin request detected")]
     CrossOriginRequest,
 
     /// A cross-origin request was detected.
-    #[error("Cross-Origin request from old browser detected")]
     CrossOriginRequestFromOldBrowser,
 }
+
+impl fmt::Display for ProtectionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtectionError::CrossOriginRequest => f.write_str("Cross-Origin request detected"),
+            ProtectionError::CrossOriginRequestFromOldBrowser => {
+                f.write_str("Cross-Origin request from old browser detected")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProtectionError {}
 
 type BypassFn = dyn Fn(&Method, &Uri) -> bool + Send + Sync + 'static;
 
