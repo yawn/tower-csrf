@@ -738,6 +738,28 @@ mod tests {
     }
 
     #[test]
+    fn test_middleware_bypass_applies_when_origin_unparseable() {
+        init();
+
+        let middleware = CrossOriginProtectionLayer::default()
+            .with_insecure_bypass(|_method, uri| uri.path() == "/bypass")
+            .layer(());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://example.com/bypass")
+            .header("host", "example.com")
+            .header(
+                "origin",
+                http::HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+            )
+            .body(())
+            .unwrap();
+
+        assert_eq!(middleware.verify(&req), Ok(()));
+    }
+
+    #[test]
     fn test_middleware_bypass() {
         init();
 
