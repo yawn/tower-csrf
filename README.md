@@ -17,3 +17,7 @@ This boils down to (quoting from the blog):
 5. If the Origin header’s host (including the port) matches the Host header, allow the request, otherwise reject it
 
 See [tests/csrf.rs](tests/axum.rs) for an example using Axum.
+
+## Deployment caveat
+
+The middleware trusts whatever `Origin` and `Host` reach it. Reverse proxies and load balancers that rewrite `Host` (e.g. to an internal hostname) or strip `Origin` silently degrade the protection: the Origin/Host fallback can no longer match, and `Sec-Fetch-Site` becomes the only remaining line of defense. Configure intermediaries to forward both headers unchanged.
