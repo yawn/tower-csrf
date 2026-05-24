@@ -20,28 +20,6 @@ fn create_app() -> Router {
 }
 
 #[tokio::test]
-async fn test_foo_endpoint_returns_foo() {
-    let app = create_app();
-
-    let req = Request::builder()
-        .method("GET")
-        .uri("/foo")
-        .body(Body::empty())
-        .unwrap();
-
-    let res = app.oneshot(req).await.unwrap();
-
-    assert_eq!(res.status(), StatusCode::OK);
-
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-        .await
-        .unwrap();
-
-    let body_str = std::str::from_utf8(&body).unwrap();
-    assert_eq!(body_str, "foo");
-}
-
-#[tokio::test]
 async fn test_bar_endpoint_returns_csrf_error() {
     let app = create_app();
 
@@ -81,4 +59,26 @@ async fn test_bar_endpoint_succeeds_with_trusted_origin() {
         .unwrap();
 
     assert_eq!(std::str::from_utf8(&body).unwrap(), "bar");
+}
+
+#[tokio::test]
+async fn test_foo_endpoint_returns_foo() {
+    let app = create_app();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/foo")
+        .body(Body::empty())
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let body_str = std::str::from_utf8(&body).unwrap();
+    assert_eq!(body_str, "foo");
 }
