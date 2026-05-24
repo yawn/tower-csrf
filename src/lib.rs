@@ -65,27 +65,13 @@ pub enum ProtectionError {
     CrossOriginRequestFromOldBrowser,
 }
 
-struct Bypass<T: Fn(&Method, &Uri) -> bool>(T);
+type BypassFn = dyn Fn(&Method, &Uri) -> bool + Send + Sync + 'static;
 
-impl<T: Fn(&Method, &Uri) -> bool> std::fmt::Debug for Bypass<T> {
+struct DebugFn;
+
+impl std::fmt::Debug for DebugFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("<fn>").finish()
-    }
-}
-
-trait Filter: std::fmt::Debug + Send + Sync {
-    fn is_bypassed(&self, method: &Method, uri: &Uri) -> bool;
-}
-
-impl<T: Fn(&Method, &Uri) -> bool> Filter for Option<Bypass<T>>
-where
-    T: Send + Sync,
-{
-    fn is_bypassed(&self, method: &Method, uri: &Uri) -> bool {
-        match self {
-            Some(ref p) => p.0(method, uri),
-            None => false,
-        }
+        f.write_str("<fn>")
     }
 }
 
@@ -103,18 +89,21 @@ impl Origins {
 }
 
 /// Decorates a HTTP service with CSRF protection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Default)]
 pub struct CrossOriginProtectionLayer {
-    insecure_bypass: Arc<dyn Filter>,
+    insecure_bypass: Option<Arc<BypassFn>>,
     trusted_origins: Origins,
 }
 
-impl Default for CrossOriginProtectionLayer {
-    fn default() -> Self {
-        CrossOriginProtectionLayer {
-            insecure_bypass: Arc::new(Option::<Bypass<fn(&Method, &Uri) -> bool>>::default()),
-            trusted_origins: Origins::default(),
-        }
+impl std::fmt::Debug for CrossOriginProtectionLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossOriginProtectionLayer")
+            .field(
+                "insecure_bypass",
+                &self.insecure_bypass.as_ref().map(|_| DebugFn),
+            )
+            .field("trusted_origins", &self.trusted_origins)
+            .finish()
     }
 }
 
@@ -138,16 +127,14 @@ impl CrossOriginProtectionLayer {
 
     /// Adds a bypass function that returns `true` if the given request should bypass CSRF protection. Notes that this
     /// might be insecure.
-    pub fn with_insecure_bypass<F>(self, predicate: F) -> CrossOriginProtectionLayer
+    pub fn with_insecure_bypass<F>(mut self, predicate: F) -> CrossOriginProtectionLayer
     where
         F: Fn(&Method, &Uri) -> bool + Send + Sync + 'static,
     {
         debug!("added insecure bypass");
 
-        CrossOriginProtectionLayer {
-            insecure_bypass: Arc::new(Some(Bypass(predicate))),
-            trusted_origins: self.trusted_origins,
-        }
+        self.insecure_bypass = Some(Arc::new(predicate));
+        self
     }
 }
 
@@ -164,10 +151,10 @@ impl<S> Layer<S> for CrossOriginProtectionLayer {
 }
 
 /// CSRF protection middleware for HTTP requests.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CrossOriginProtectionMiddleware<S> {
     inner: S,
-    insecure_bypass: Arc<dyn Filter>,
+    insecure_bypass: Option<Arc<BypassFn>>,
     trusted_origins: Origins,
 }
 
@@ -175,9 +162,22 @@ impl<S: Default> Default for CrossOriginProtectionMiddleware<S> {
     fn default() -> Self {
         Self {
             inner: S::default(),
-            insecure_bypass: Arc::new(Option::<Bypass<fn(&Method, &Uri) -> bool>>::default()),
+            insecure_bypass: None,
             trusted_origins: Origins::default(),
         }
+    }
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for CrossOriginProtectionMiddleware<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossOriginProtectionMiddleware")
+            .field("inner", &self.inner)
+            .field(
+                "insecure_bypass",
+                &self.insecure_bypass.as_ref().map(|_| DebugFn),
+            )
+            .field("trusted_origins", &self.trusted_origins)
+            .finish()
     }
 }
 
@@ -212,7 +212,11 @@ where
 impl<S> CrossOriginProtectionMiddleware<S> {
     #[instrument(skip(self, origin), fields(uri = %uri))]
     fn is_exempt(&self, method: &Method, uri: &Uri, origin: Option<&Uri>) -> bool {
-        if self.insecure_bypass.is_bypassed(method, uri) {
+        if self
+            .insecure_bypass
+            .as_ref()
+            .is_some_and(|p| p(method, uri))
+        {
             trace!("request passed: bypassed");
             return true;
         }
