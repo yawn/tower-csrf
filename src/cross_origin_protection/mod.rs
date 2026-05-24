@@ -274,6 +274,20 @@ mod tests {
                 result: Ok(()),
             },
             Test {
+                name: "host implicit, origin explicit non-default",
+                uri: "/",
+                host: Some("example.com"),
+                origin: "https://example.com:8443",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+            Test {
+                name: "missing host, uri authority implicit, origin explicit non-default",
+                uri: "https://example.com/path",
+                host: None,
+                origin: "https://example.com:8443",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+            Test {
                 name: "unparseable host falls back to uri authority",
                 uri: "https://example.com/path",
                 host: Some("not a valid authority"),

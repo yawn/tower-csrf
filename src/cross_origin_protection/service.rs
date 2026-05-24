@@ -110,7 +110,10 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
             if let (Some(origin_host), Some(host_name)) = (uri.host(), host_name) {
                 let port_origin = uri.effective_port();
-                let port_host = port_host.or(port_origin);
+                // Host carries no scheme of its own; assume Origin's scheme so an implicit
+                // Host port resolves to Origin's scheme default (443/80) rather than
+                // silently inheriting Origin's explicit port.
+                let port_host = port_host.or_else(|| uri.scheme_default_port());
 
                 if origin_host.eq_ignore_ascii_case(host_name) && port_origin == port_host {
                     #[cfg(feature = "tracing")]

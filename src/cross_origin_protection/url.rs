@@ -24,6 +24,8 @@ pub(crate) trait UriExt: Sized {
 
     fn effective_port(&self) -> Option<u16>;
 
+    fn scheme_default_port(&self) -> Option<u16>;
+
     fn parse_origin(input: &str) -> Result<Self, ConfigError>;
 }
 
@@ -42,11 +44,15 @@ impl UriExt for Uri {
     }
 
     fn effective_port(&self) -> Option<u16> {
-        self.port_u16().or_else(|| match self.scheme_str() {
+        self.port_u16().or_else(|| self.scheme_default_port())
+    }
+
+    fn scheme_default_port(&self) -> Option<u16> {
+        match self.scheme_str() {
             Some("https") => Some(443),
             Some("http") => Some(80),
             _ => None,
-        })
+        }
     }
 
     fn parse_origin(input: &str) -> Result<Self, ConfigError> {
