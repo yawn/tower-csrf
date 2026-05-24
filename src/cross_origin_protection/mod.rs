@@ -81,7 +81,6 @@ mod tests {
 
     use http::Request;
     use tower::Layer;
-    use tracing::Level;
 
     use super::*;
 
@@ -89,8 +88,9 @@ mod tests {
 
     fn init() {
         INIT.call_once(|| {
+            #[cfg(feature = "tracing")]
             tracing_subscriber::fmt()
-                .with_max_level(Level::TRACE)
+                .with_max_level(tracing::Level::TRACE)
                 .init();
         });
     }

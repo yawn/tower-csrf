@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use http::{Method, Uri};
 use tower::Layer;
-use tracing::debug;
 
 use super::service::CrossOriginProtectionMiddleware;
 use super::url::TrustedOrigin;
@@ -36,7 +35,8 @@ impl CrossOriginProtectionLayer {
     pub fn add_trusted_origin<S: AsRef<str>>(mut self, origin: S) -> Result<Self, ConfigError> {
         let normalized = TrustedOrigin::parse(origin.as_ref())?.into_canonical();
 
-        debug!(origin = %normalized, "added trusted origin");
+        #[cfg(feature = "tracing")]
+        tracing::debug!(origin = %normalized, "added trusted origin");
 
         self.trusted_origins.insert(normalized);
 
@@ -49,7 +49,8 @@ impl CrossOriginProtectionLayer {
     where
         F: Fn(&Method, &Uri) -> bool + Send + Sync + 'static,
     {
-        debug!("added insecure bypass");
+        #[cfg(feature = "tracing")]
+        tracing::debug!("added insecure bypass");
 
         self.insecure_bypass = Some(Arc::new(predicate));
         self

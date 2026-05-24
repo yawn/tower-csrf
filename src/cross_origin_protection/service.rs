@@ -5,7 +5,6 @@ use std::task::{Context, Poll};
 
 use http::{Method, Request, Response, Uri};
 use tower::Service;
-use tracing::{instrument, trace};
 
 use super::future::ResponseFuture;
 use super::url::UriExt;
@@ -32,14 +31,14 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         }
     }
 
-    #[instrument(skip(self, origin), fields(uri = %uri))]
     fn is_exempt(&self, method: &Method, uri: &Uri, origin: Option<&Uri>) -> bool {
         if self
             .insecure_bypass
             .as_ref()
             .is_some_and(|p| p(method, uri))
         {
-            trace!("request passed: bypassed");
+            #[cfg(feature = "tracing")]
+            tracing::trace!(uri = %uri, "request passed: bypassed");
             return true;
         }
 
@@ -48,20 +47,21 @@ impl<S> CrossOriginProtectionMiddleware<S> {
             .is_some_and(|s| self.trusted_origins.contains(&s));
 
         if trusted {
-            trace!("request passed: trusted origin");
+            #[cfg(feature = "tracing")]
+            tracing::trace!(uri = %uri, "request passed: trusted origin");
             return true;
         }
 
         false
     }
 
-    #[instrument(skip(self, req), fields(uri = %req.uri()))]
     pub(super) fn verify<Body>(&self, req: &Request<Body>) -> Result<(), ProtectionError> {
         if matches!(
             req.method(),
             &Method::GET | &Method::HEAD | &Method::OPTIONS
         ) {
-            trace!("request passed: safe method");
+            #[cfg(feature = "tracing")]
+            tracing::trace!(uri = %req.uri(), "request passed: safe method");
             return Ok(());
         }
 
@@ -77,7 +77,8 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         // Fetch spec mandates lowercase here; exact byte match is intentional.
         match sec_fetch_site {
             Some(b"same-origin") | Some(b"none") => {
-                trace!("request passed: sec-fetch-site is same-origin or none");
+                #[cfg(feature = "tracing")]
+                tracing::trace!(uri = %req.uri(), "request passed: sec-fetch-site is same-origin or none");
                 return Ok(());
             }
             None | Some(b"") => {} // fall through to Origin check
@@ -88,7 +89,8 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         }
 
         if matches!(origin, None | Some(b"")) {
-            trace!("request passed: neither sec-fetch-site nor origin header (same-origin or not a browser request)");
+            #[cfg(feature = "tracing")]
+            tracing::trace!(uri = %req.uri(), "request passed: neither sec-fetch-site nor origin header (same-origin or not a browser request)");
             return Ok(());
         }
 
@@ -111,7 +113,8 @@ impl<S> CrossOriginProtectionMiddleware<S> {
                 let port_host = port_host.or(port_origin);
 
                 if origin_host.eq_ignore_ascii_case(host_name) && port_origin == port_host {
-                    trace!("request passed: origin is same as host");
+                    #[cfg(feature = "tracing")]
+                    tracing::trace!(uri = %req.uri(), "request passed: origin is same as host");
                     return Ok(());
                 }
             }
