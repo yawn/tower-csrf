@@ -4,7 +4,7 @@ edition = "2021"
 license-file = "LICENSE"
 name = "tower-csrf"
 repository = "https://github.com/yawn/tower-csrf"
-rust-version = "1.66"
+rust-version = "1.64"
 version = "0.1.0"
 
 [features]
