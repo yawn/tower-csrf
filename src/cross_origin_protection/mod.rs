@@ -569,9 +569,8 @@ mod tests {
         init();
 
         // Each row inserts a non-canonical form of the trusted origin and
-        // sends a request bearing the canonical browser-style Origin header.
-        // Pre-M2 these would all silently fail to match because the raw
-        // input string was stored byte-for-byte.
+        // sends a request bearing the canonical browser-style Origin header;
+        // the test fails if canonicalization is dropped on either side.
         struct Test {
             name: &'static str,
             trusted: &'static str,
