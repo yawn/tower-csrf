@@ -77,22 +77,22 @@ impl Origins {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
-
     use http::Request;
     use tower::Layer;
 
     use super::*;
 
-    static INIT: Once = Once::new();
-
     fn init() {
-        INIT.call_once(|| {
-            #[cfg(feature = "tracing")]
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .init();
-        });
+        #[cfg(feature = "tracing")]
+        {
+            use std::sync::Once;
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .init();
+            });
+        }
     }
 
     #[test]
