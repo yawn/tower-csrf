@@ -619,7 +619,7 @@ mod tests {
                 result: Ok(()),
             },
             Test {
-                name: "PUT allowed",
+                name: "PUT blocked",
                 method: Method::PUT,
                 sec_fetch_site: Some(b"cross-site"),
                 origin: None,
