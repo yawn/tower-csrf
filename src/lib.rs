@@ -276,18 +276,21 @@ impl<S> CrossOriginProtectionMiddleware<S> {
                     .and_then(|s| Url::parse(s).ok());
 
                 if let Some(origin_url) = parsed {
-                    let origin_host = origin_url.host_str();
-                    let host = req.headers().get("host").and_then(|h| h.to_str().ok());
+                    // Compare effective ports (scheme default when implicit). Host has no
+                    // scheme, so http→https can't be detected here; fail open per HSTS.
+                    let authority = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|h| h.parse::<http::uri::Authority>().ok());
 
-                    // the origin header matches the host header. note that the host header
-                    // doesn't include the scheme, so we don't know if this might be an
-                    // http→https cross-origin request. we fail open, since all modern
-                    // browsers support sec-fetch-site since 2023, and running an older
-                    // browser makes a clear security trade-off already. sites can mitigate
-                    // this with http strict transport security (hsts).
+                    if let (Some(origin_host), Some(authority)) =
+                        (origin_url.host_str(), authority)
+                    {
+                        let origin_port = origin_url.port_or_known_default();
+                        let host_port = authority.port_u16().or(origin_port);
 
-                    if let (Some(origin_host), Some(host)) = (origin_host, host) {
-                        if origin_host == host {
+                        if origin_host == authority.host() && origin_port == host_port {
                             trace!("request passed: origin is same as host");
                             return Ok(());
                         }
@@ -423,6 +426,76 @@ mod tests {
                 .unwrap();
 
             assert_eq!(middleware.verify(&req), Ok(()), "{}", test.name);
+        }
+    }
+
+    #[test]
+    fn test_middleware_origin_host_port_match() {
+        init();
+
+        let middleware: CrossOriginProtectionMiddleware<()> = Default::default();
+
+        struct Test {
+            name: &'static str,
+            host: &'static str,
+            origin: &'static str,
+            result: Result<(), ProtectionError>,
+        }
+
+        let tests = [
+            Test {
+                name: "default port both sides",
+                host: "example.com",
+                origin: "https://example.com",
+                result: Ok(()),
+            },
+            Test {
+                name: "same non-default port both sides",
+                host: "example.com:8443",
+                origin: "https://example.com:8443",
+                result: Ok(()),
+            },
+            Test {
+                name: "explicit default port both sides",
+                host: "example.com:443",
+                origin: "https://example.com:443",
+                result: Ok(()),
+            },
+            Test {
+                name: "mismatched non-default ports",
+                host: "example.com:8443",
+                origin: "https://example.com:8444",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+            Test {
+                name: "origin has explicit default, host implicit",
+                host: "example.com",
+                origin: "https://example.com:443",
+                result: Ok(()),
+            },
+            Test {
+                name: "host has explicit default, origin implicit",
+                host: "example.com:443",
+                origin: "https://example.com",
+                result: Ok(()),
+            },
+            Test {
+                name: "unparseable host",
+                host: "not a valid authority",
+                origin: "https://example.com",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+        ];
+
+        for test in tests {
+            let req = Request::builder()
+                .method(Method::POST)
+                .header("host", test.host)
+                .header("origin", test.origin)
+                .body(())
+                .unwrap();
+
+            assert_eq!(middleware.verify(&req), test.result, "{}", test.name);
         }
     }
 
