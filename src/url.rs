@@ -2,6 +2,23 @@ use http::Uri;
 
 use crate::ConfigError;
 
+pub(crate) struct TrustedOrigin(String);
+
+impl TrustedOrigin {
+    pub(crate) fn parse(input: &str) -> Result<Self, ConfigError> {
+        let uri = Uri::parse_origin(input)?;
+
+        Ok(Self(
+            uri.canonical()
+                .expect("parse_origin validates scheme and host"),
+        ))
+    }
+
+    pub(crate) fn into_canonical(self) -> String {
+        self.0
+    }
+}
+
 pub(crate) trait UriExt: Sized {
     fn canonical(&self) -> Option<String>;
 

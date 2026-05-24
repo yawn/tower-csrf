@@ -24,7 +24,7 @@ use tower::{BoxError, Layer, Service};
 use tracing::{debug, instrument, trace};
 
 mod url;
-use url::UriExt;
+use url::{TrustedOrigin, UriExt};
 
 /// Errors that can occur during configuration of the layer.
 #[derive(Clone, Debug, thiserror::Error, PartialEq)]
@@ -112,11 +112,8 @@ impl CrossOriginProtectionLayer {
     /// the given value.
     ///
     /// Origin header values are of the form `scheme://host[:port]`.
-    pub fn add_trusted_origin<S: Into<String>>(mut self, origin: S) -> Result<Self, ConfigError> {
-        let origin = origin.into();
-        let normalized = Uri::parse_origin(&origin)?
-            .canonical()
-            .expect("parse_origin validates scheme and host");
+    pub fn add_trusted_origin<S: AsRef<str>>(mut self, origin: S) -> Result<Self, ConfigError> {
+        let normalized = TrustedOrigin::parse(origin.as_ref())?.into_canonical();
 
         debug!(origin = %normalized, "added trusted origin");
 
