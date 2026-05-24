@@ -70,7 +70,8 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         let origin_uri = origin
             .filter(|b| !b.is_empty())
             .and_then(|b| str::from_utf8(b).ok())
-            .and_then(|s| s.parse::<Uri>().ok());
+            .and_then(|s| s.parse::<Uri>().ok())
+            .filter(|u| matches!(u.scheme_str(), Some("http" | "https")));
 
         let sec_fetch_site = req.headers().get("sec-fetch-site").map(|h| h.as_bytes());
 

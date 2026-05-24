@@ -315,6 +315,20 @@ mod tests {
                 origin: "https://example.com",
                 result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
             },
+            Test {
+                name: "scheme-less origin does not match host even if bytes agree",
+                uri: "/",
+                host: Some("example.com:8443"),
+                origin: "example.com:8443",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
+            Test {
+                name: "non-http origin scheme does not enter host fallback",
+                uri: "/",
+                host: Some("example.com:8443"),
+                origin: "ftp://example.com:8443",
+                result: Err(ProtectionError::CrossOriginRequestFromOldBrowser),
+            },
         ];
 
         for test in tests {
