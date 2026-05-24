@@ -35,7 +35,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
         if self
             .insecure_bypass
             .as_ref()
-            .is_some_and(|p| p(method, uri))
+            .map_or(false, |p| p(method, uri))
         {
             #[cfg(feature = "tracing")]
             tracing::trace!(uri = %uri, "request passed: bypassed");
@@ -44,7 +44,7 @@ impl<S> CrossOriginProtectionMiddleware<S> {
 
         let trusted = origin
             .and_then(|u| u.canonical())
-            .is_some_and(|s| self.trusted_origins.contains(&s));
+            .map_or(false, |s| self.trusted_origins.contains(&s));
 
         if trusted {
             #[cfg(feature = "tracing")]

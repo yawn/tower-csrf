@@ -101,10 +101,9 @@ mod tests {
 
         // Smoke check that the layer threads parse_origin's Ok and Err
         // through; the full validation matrix lives in url.rs.
-        assert!(matches!(
-            CrossOriginProtectionLayer::default().add_trusted_origin("https://example.com"),
-            Ok(_)
-        ));
+        assert!(CrossOriginProtectionLayer::default()
+            .add_trusted_origin("https://example.com")
+            .is_ok());
         assert!(matches!(
             CrossOriginProtectionLayer::default().add_trusted_origin("not a valid url"),
             Err(ConfigError::InvalidOriginUrl { .. })

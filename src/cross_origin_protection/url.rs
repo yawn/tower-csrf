@@ -72,7 +72,7 @@ impl UriExt for Uri {
                 })?;
 
         if !matches!(uri.scheme_str(), Some("http" | "https"))
-            || uri.host().is_none_or(|h| h.is_empty())
+            || uri.host().map_or(true, |h| h.is_empty())
         {
             return Err(ConfigError::OpaqueOrigin {
                 origin: input.to_owned(),
@@ -210,7 +210,8 @@ mod tests {
         // Each row maps an input to the expected ConfigError variant.
         // Marker functions over closures because PartialEq on the enum already
         // makes equality the easy assertion shape.
-        let cases: &[(&str, fn(&ConfigError) -> bool)] = &[
+        type Check = fn(&ConfigError) -> bool;
+        let cases: &[(&str, Check)] = &[
             // http::Uri rejects these outright at parse time.
             ("not a valid url", |e| {
                 matches!(e, ConfigError::InvalidOriginUrl { .. })
