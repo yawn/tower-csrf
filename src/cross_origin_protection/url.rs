@@ -1,6 +1,6 @@
 use http::Uri;
 
-use crate::ConfigError;
+use super::ConfigError;
 
 pub(crate) struct TrustedOrigin(String);
 
