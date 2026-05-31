@@ -1,5 +1,12 @@
 # tower-csrf
 
+> [!CAUTION]
+> **THIS CRATE IS DEPRECATED / OBSOLETE**
+>
+> The result of this PoC has been **merged to** the **`http-tower`** crate in https://github.com/tower-rs/tower-http/pull/699.
+> 
+> I will **depublish** the associated **crate** in ~6 months (01.01.2027) from now.
+
 [![CI](https://github.com/yawn/tower-csrf/actions/workflows/rust.yml/badge.svg)](https://github.com/yawn/tower-csrf/actions/workflows/rust.yml)
 
 This is _experimental_ middleware for tower. It has not received a formal audit.
